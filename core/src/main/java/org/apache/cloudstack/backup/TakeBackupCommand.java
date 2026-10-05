@@ -47,6 +47,11 @@ public class TakeBackupCommand extends Command {
     // every data disk onto the root file. New callers MUST populate parentPaths.
     private List<String> parentPaths;
 
+    // RBD provider: name of the parent RBD snapshot to diff from (--from-snap). Additive only;
+    // null for NAS/legacy callers. Mirrors bitmapParent but kept distinct so the RBD host script
+    // can read it via --parent-snap without coupling to the NAS bitmap vocabulary.
+    private String parentSnapName;
+
     public TakeBackupCommand(String vmName, String backupPath) {
         super();
         this.vmName = vmName;
@@ -147,6 +152,26 @@ public class TakeBackupCommand extends Command {
 
     public void setParentPaths(List<String> parentPaths) {
         this.parentPaths = parentPaths;
+    }
+
+    public String getParentSnapName() {
+        return parentSnapName;
+    }
+
+    public void setParentSnapName(String parentSnapName) {
+        this.parentSnapName = parentSnapName;
+    }
+
+    // RBD provider: comma-separated authoritative per-disk type list ("root"/"datadisk") in
+    // deviceId-asc order, matching volumePaths. Additive only; null for NAS/legacy callers.
+    private String diskTypes;
+
+    public String getDiskTypes() {
+        return diskTypes;
+    }
+
+    public void setDiskTypes(String diskTypes) {
+        this.diskTypes = diskTypes;
     }
 
     @Override

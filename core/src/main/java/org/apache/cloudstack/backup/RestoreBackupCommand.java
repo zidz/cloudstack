@@ -40,6 +40,10 @@ public class RestoreBackupCommand extends Command  {
     private Boolean vmExists;
     private VirtualMachine.State vmState;
     private Integer mountTimeout;
+    // RBD restore only: the base snapshot name the first .rbdiff was exported --from-snap. The
+    // host script creates it on the destination image so rbd import-diff can apply the chain.
+    // Null for full-only restores and for non-RBD providers.
+    private String baseSnap;
 
     protected RestoreBackupCommand() {
         super();
@@ -163,5 +167,13 @@ public class RestoreBackupCommand extends Command  {
 
     public void setMountTimeout(Integer mountTimeout) {
         this.mountTimeout = mountTimeout;
+    }
+
+    public String getBaseSnap() {
+        return baseSnap;
+    }
+
+    public void setBaseSnap(String baseSnap) {
+        this.baseSnap = baseSnap;
     }
 }

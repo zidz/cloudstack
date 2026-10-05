@@ -86,9 +86,12 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
             }
         }
 
+        // Route pure-RBD VMs to rbdbackup.sh (rbd CLI snapshot/diff engine); every other pool
+        // type keeps the exact nasbackup.sh path. NAS behavior is unchanged byte-for-byte.
+        String backupScriptPath = getBackupScriptPath(libvirtComputingResource, volumePools);
         Pair<Integer, String> result = runBackupScript(libvirtComputingResource, command, vmName, backupRepoType, backupRepoAddress,
                 mountOptions, backupPath, diskPaths, command.getMode(),
-                command.getBitmapNew(), command.getBitmapParent(), command.getParentPaths(), timeout);
+                command.getBitmapNew(), command.getBitmapParent(), command.getParentPaths(), timeout, backupScriptPath);
 
         if (result.first() != 0) {
             logger.debug("Failed to take VM backup: " + result.second());
@@ -136,14 +139,36 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
     }
 
     /**
+     * Resolve the host backup script for this command. Pure-RBD VMs (every volume pool is RBD)
+     * route to {@code rbdbackup.sh}, resolved as a sibling of {@code nasbackup.sh} so no change
+     * to {@link LibvirtComputingResource} is required. Any other pool type — including mixed
+     * RBD/non-RBD VMs and the NAS provider's own commands — keeps the exact {@code nasbackup.sh}
+     * path, so NAS behavior is unchanged byte-for-byte.
+     */
+    private String getBackupScriptPath(LibvirtComputingResource libvirtComputingResource, List<PrimaryDataStoreTO> volumePools) {
+        final String nasPath = libvirtComputingResource.getNasBackupPath();
+        if (volumePools == null || volumePools.isEmpty()) {
+            return nasPath;
+        }
+        for (PrimaryDataStoreTO pool : volumePools) {
+            if (pool == null || pool.getPoolType() != Storage.StoragePoolType.RBD) {
+                return nasPath;
+            }
+        }
+        final String scriptsDir = new java.io.File(nasPath).getParent();
+        final String rbdPath = Script.findScript(scriptsDir, "rbdbackup.sh");
+        return rbdPath != null ? rbdPath : nasPath;
+    }
+
+    /**
      * Run nasbackup.sh once with the given args. Returns the exit code + captured stdout.
      */
     private Pair<Integer, String> runBackupScript(LibvirtComputingResource libvirtComputingResource,
             TakeBackupCommand command, String vmName, String backupRepoType, String backupRepoAddress,
             String mountOptions, String backupPath, List<String> diskPaths, String mode,
-            String bitmapNew, String bitmapParent, List<String> parentPaths, int timeout) {
+            String bitmapNew, String bitmapParent, List<String> parentPaths, int timeout, String backupScriptPath) {
         List<String> argv = new ArrayList<>(Arrays.asList(
-                libvirtComputingResource.getNasBackupPath(),
+                backupScriptPath,
                 "-o", "backup",
                 "-v", vmName,
                 "-t", backupRepoType,
@@ -168,6 +193,12 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
         if (parentPaths != null && !parentPaths.isEmpty()) {
             argv.add("--parent-paths");
             argv.add(String.join(",", parentPaths));
+        }
+        // Provider-supplied authoritative per-disk types in deviceId-asc order; omit when absent
+        // so the script falls back to positional root/datadisk (NAS path untouched).
+        if (backupScriptPath != null && backupScriptPath.endsWith("rbdbackup.sh") && command.getDiskTypes() != null && !command.getDiskTypes().trim().isEmpty()) {
+            argv.add("--disk-types");
+            argv.add(command.getDiskTypes());
         }
 
         List<String[]> commands = new ArrayList<>();

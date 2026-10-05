@@ -29,6 +29,15 @@ public class DeleteBackupCommand extends Command {
     @LogLevel(LogLevel.Log4jLevel.Off)
     private String mountOptions;
 
+    // ADDITIVE, serialization-safe RBD snapshot-cleanup hints. The NAS provider never reads or
+    // sets them, so NAS delete behavior is byte-for-byte unchanged; only the RBD provider
+    // populates them so the KVM delete wrapper can unprotect+remove a now-unneeded protected
+    // snapshot. Both stay null for NAS and for RBD deletes that need no snapshot cleanup.
+    @LogLevel(LogLevel.Log4jLevel.Off)
+    private String rbdUri;
+    @LogLevel(LogLevel.Log4jLevel.Off)
+    private String rbdSnapName;
+
     public DeleteBackupCommand(String backupPath, String backupRepoType, String backupRepoAddress, String mountOptions) {
         super();
         this.backupPath = backupPath;
@@ -67,6 +76,22 @@ public class DeleteBackupCommand extends Command {
 
     public void setMountOptions(String mountOptions) {
         this.mountOptions = mountOptions;
+    }
+
+    public String getRbdUri() {
+        return rbdUri;
+    }
+
+    public void setRbdUri(String rbdUri) {
+        this.rbdUri = rbdUri;
+    }
+
+    public String getRbdSnapName() {
+        return rbdSnapName;
+    }
+
+    public void setRbdSnapName(String rbdSnapName) {
+        this.rbdSnapName = rbdSnapName;
     }
 
     @Override
