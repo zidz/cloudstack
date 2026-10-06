@@ -56,6 +56,8 @@ BASE_SNAP=""          # For restore: the base snapshot name the first .rbdiff wa
                       # --from-snap. rbd import-diff requires the destination image to already
                       # contain this snapshot, so restore creates it on the destination after the
                       # base import. Empty for a single-file (base-only) restore with no diffs.
+NEW_IMAGE=""          # For restore-as-template: the NEW RBD image name to import the chain into.
+EXPORT_TO=""          # For restore-as-template: optional raw file path to rbd export the image to.
 verb=0
 logFile="/var/log/cloudstack/agent/agent.log"
 UNMOUNT_TIMEOUT=60
@@ -357,6 +359,51 @@ backup_vm() {
 # (base .rbd first, then each .rbdiff in root->leaf order). The source volume uuid is embedded in
 # the file names; -d carries ONLY the import DESTINATION (rbd:<pool>/<uuid>:mon_host=...), so we
 # parse the destination pool/uuid from -d and parse its mon_host/id/key via parse_rbd_uri. No globbing.
+# replay_chain_into <pool> <image> <base_snap> <file1> [file2 ...]
+# Replays an ordered backup chain (base .rbd first, then ascending .rbdiff links) into the given
+# destination image. Does NOT purge or create the image — callers decide that policy. The first
+# file is imported as the base; if <base_snap> is non-empty it is created on the destination so the
+# first import-diff applies (each later import-diff creates the end snap the next link needs, so
+# the chain self-sustains). Shared by restore_vm (in-place) and restore_as_template (new image).
+replay_chain_into() {
+  local pool="$1"; shift
+  local image="$1"; shift
+  local base_snap="$1"; shift
+
+  local idx=0
+  local f
+  for f in "$@"; do
+    if [[ ! -f "$f" ]]; then
+      echo "Restore backup file does not exist: $f"
+      exit 1
+    fi
+    if [[ $idx -eq 0 ]]; then
+      # Base full: import the raw image into the destination RBD image.
+      if ! rbd_cmd import "$f" --pool "$pool" "$image" >>"$logFile" 2>&1; then
+        echo "rbd import failed for $f into $pool/$image"
+        exit 1
+      fi
+      # rbd import-diff requires the destination image to ALREADY contain the snapshot the first
+      # .rbdiff was exported --from-snap. Create that base snapshot here so the first diff applies.
+      if [[ -n "$base_snap" ]]; then
+        if ! rbd_cmd snap create --pool "$pool" "$image@$base_snap" >>"$logFile" 2>&1; then
+          echo "rbd snap create failed for $pool/$image@$base_snap (required as diff base)"
+          exit 1
+        fi
+      fi
+    else
+      # Incremental link: replay the diff onto the destination image.
+      if ! rbd_cmd import-diff "$f" --pool "$pool" "$image" >>"$logFile" 2>&1; then
+        echo "rbd import-diff failed for $f into $pool/$image"
+        exit 1
+      fi
+    fi
+    idx=$((idx + 1))
+  done
+
+  sync
+}
+
 restore_vm() {
   if [[ -z "$RESTORE_FILES" ]]; then
     echo "Restore requires --restore-files with an explicit ordered chain"
@@ -374,54 +421,84 @@ restore_vm() {
   IFS=',' read -ra files <<< "$RESTORE_FILES"
   unset IFS
 
-  local idx=0
-  for f in "${files[@]}"; do
-    if [[ ! -f "$f" ]]; then
-      echo "Restore backup file does not exist: $f"
+  # Restore-to-existing-VM: the destination image is the live VM's current volume. A full
+  # restore replaces the whole disk, and `rbd import` cannot overwrite an existing image
+  # (fails with (17) File exists), so purge any existing image first. `rbd rm` refuses while
+  # snapshots exist, so unprotect+remove them before removing the image.
+  if rbd_cmd info --pool "$pool" "$uuid" >/dev/null 2>&1; then
+    for s in $(rbd_cmd snap ls --pool "$pool" "$uuid" 2>/dev/null | awk 'NR>1 {print $2}'); do
+      # Benign failures (already unprotected / already gone) must not abort under set -e.
+      rbd_cmd snap unprotect --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
+      rbd_cmd snap rm --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
+    done
+    if ! rbd_cmd rm --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
+      echo "rbd rm failed for existing $pool/$uuid (required before base import)"
       exit 1
     fi
-    if [[ $idx -eq 0 ]]; then
-      # Restore-to-existing-VM: the destination image is the live VM's current volume. A full
-      # restore replaces the whole disk, and `rbd import` cannot overwrite an existing image
-      # (fails with (17) File exists), so purge any existing image first. `rbd rm` refuses while
-      # snapshots exist, so unprotect+remove them before removing the image.
-      if rbd_cmd info --pool "$pool" "$uuid" >/dev/null 2>&1; then
-        for s in $(rbd_cmd snap ls --pool "$pool" "$uuid" 2>/dev/null | awk 'NR>1 {print $2}'); do
-          # Benign failures (already unprotected / already gone) must not abort under set -e.
-          rbd_cmd snap unprotect --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
-          rbd_cmd snap rm --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
-        done
-        if ! rbd_cmd rm --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
-          echo "rbd rm failed for existing $pool/$uuid (required before base import)"
-          exit 1
-        fi
-      fi
-      # Base full: import the raw image into the destination RBD image.
-      if ! rbd_cmd import "$f" --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
-        echo "rbd import failed for $f into $pool/$uuid"
-        exit 1
-      fi
-      # rbd import-diff requires the destination image to ALREADY contain the snapshot the first
-      # .rbdiff was exported --from-snap. Create that base snapshot here so the first diff applies;
-      # each subsequent import-diff then creates the end snapshot the next link needs, so the whole
-      # chain self-sustains from this single creation. Only needed when a diff chain follows.
-      if [[ -n "$BASE_SNAP" ]]; then
-        if ! rbd_cmd snap create --pool "$pool" "$uuid@$BASE_SNAP" >>"$logFile" 2>&1; then
-          echo "rbd snap create failed for $pool/$uuid@$BASE_SNAP (required as diff base)"
-          exit 1
-        fi
-      fi
-    else
-      # Incremental link: replay the diff onto the destination image.
-      if ! rbd_cmd import-diff "$f" --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
-        echo "rbd import-diff failed for $f into $pool/$uuid"
-        exit 1
-      fi
-    fi
-    idx=$((idx + 1))
-  done
+  fi
 
-  sync
+  replay_chain_into "$pool" "$uuid" "$BASE_SNAP" "${files[@]}"
+}
+
+# restore-as-template: rebuild a backup chain into a NEW, freely-named RBD image (never touching
+# the source VM's image), then optionally rbd export it to a raw file for registerTemplate. This is
+# the non-destructive counterpart to restore: it REFUSES if the target image already exists, so a
+# typo can never overwrite a live volume. The caller then registers the exported raw file as a
+# template and deploys a VM with any name they choose.
+restore_as_template() {
+  if [[ -z "$RESTORE_FILES" ]]; then
+    echo "restore-as-template requires --restore-files with an explicit ordered chain"
+    exit 1
+  fi
+  if [[ -z "$NEW_IMAGE" ]]; then
+    echo "restore-as-template requires --new-image <name>"
+    exit 1
+  fi
+
+  # Auth + pool come from the source disk URI (-d); the destination image name is NEW_IMAGE.
+  local dest_disk="${DISK_PATHS%%,*}"
+  parse_rbd_uri "$dest_disk"
+  local pool
+  pool="$(get_rbd_pool "$dest_disk")"
+
+  # Non-destructive guard: never overwrite an existing image.
+  if rbd_cmd info --pool "$pool" "$NEW_IMAGE" >/dev/null 2>&1; then
+    echo "restore-as-template: refusing, destination image $pool/$NEW_IMAGE already exists"
+    exit 1
+  fi
+
+  # The backup files live on the NFS repo; mount it if the caller passed repo args and the first
+  # file is not already present locally (the wrapper may pass absolute paths under a live mount).
+  local -a files=()
+  IFS=',' read -ra files <<< "$RESTORE_FILES"
+  unset IFS
+  local mounted=0
+  if [[ ! -f "${files[0]}" && -n "$REPO_TYPE" && -n "$REPO_ADDRESS" ]]; then
+    mount_operation
+    mounted=1
+    local i
+    for i in "${!files[@]}"; do
+      files[$i]="${mount_point}/${files[$i]}"
+    done
+  fi
+
+  replay_chain_into "$pool" "$NEW_IMAGE" "$BASE_SNAP" "${files[@]}"
+
+  if [[ -n "$EXPORT_TO" ]]; then
+    if ! rbd_cmd export --pool "$pool" "$NEW_IMAGE" "$EXPORT_TO" >>"$logFile" 2>&1; then
+      echo "restore-as-template: rbd export of $pool/$NEW_IMAGE to $EXPORT_TO failed"
+      [[ $mounted -eq 1 ]] && { umount "$mount_point" 2>/dev/null || true; rmdir "$mount_point" 2>/dev/null || true; }
+      exit 1
+    fi
+    echo "RESTORE_AS_TEMPLATE_EXPORTED=$EXPORT_TO"
+  fi
+
+  if [[ $mounted -eq 1 ]]; then
+    umount "$mount_point" 2>/dev/null || true
+    rmdir "$mount_point" 2>/dev/null || true
+  fi
+
+  echo "RESTORE_AS_TEMPLATE_IMAGE=$pool/$NEW_IMAGE"
 }
 
 delete_backup() {
@@ -467,6 +544,11 @@ function usage {
   echo ""
   echo "Usage: $0 -o <operation> -v <domain name> -t <storage type> -s <storage address> -m <mount options> -p <backup path> -d <disks path> -q <true|false>"
   echo "         [-M <full|incremental|legacy-full>] [--snap-new <name>] [--snap-parent <name>] [--parent-snap <name>] [--parent-paths <p1,p2,...>] [--restore-files <f1,f2,...>] [--disk-types <t1,t2,...>]"
+  echo "         [-o restore-as-template] --new-image <name> [--export-to <raw-file>] [--base-snap <name>]"
+  echo ""
+  echo "restore-as-template: rebuild a backup chain into a NEW, freely-named RBD image (never"
+  echo "  touching the source VM). Refuses if the image exists. Optionally --export-to writes a raw"
+  echo "  file for registerTemplate, so you can deploy a VM with any name. Non-destructive."
   echo ""
   echo "Incremental backup options (Ceph RBD primary storage only):"
   echo "  -M full          Create + protect a snapshot (--snap-new) and rbd export it."
@@ -514,6 +596,10 @@ while [[ $# -gt 0 ]]; do
       SNAP_NAME="$2"; shift; shift ;;
     --base-snap)
       BASE_SNAP="$2"; shift; shift ;;
+    --new-image)
+      NEW_IMAGE="$2"; shift; shift ;;
+    --export-to)
+      EXPORT_TO="$2"; shift; shift ;;
     -h|--help)
       usage; shift ;;
     *)
@@ -527,6 +613,8 @@ if [[ "$OP" == "backup" ]]; then
   backup_vm
 elif [[ "$OP" == "restore" ]]; then
   restore_vm
+elif [[ "$OP" == "restore-as-template" ]]; then
+  restore_as_template
 elif [[ "$OP" == "delete" ]]; then
   delete_backup
 elif [[ "$OP" == "delete-snap" ]]; then
