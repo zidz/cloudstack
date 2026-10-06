@@ -641,31 +641,30 @@ public class RbdBackupProvider extends AdapterBase implements BackupProvider, Co
 
     private Pair<Boolean, String> restoreVMBackup(VirtualMachine vm, Backup backup) {
         List<Backup.VolumeInfo> backedVolumes = backup.getBackedUpVolumes();
-        List<String> backedVolumesUUIDs = backedVolumes.stream()
+
+        // Pair each backed volume with the CURRENT VM volume that has the SAME UUID. The RBD image
+        // name IS the volume UUID, so matching by UUID (not positional deviceId) guarantees each
+        // per-volume chain replays onto the exact destination image it was exported from, even when
+        // the VM's device_id values have drifted since the backup was taken. backedVolumesUUIDs,
+        // restoreVolumes and restoreBackupFiles are built in ONE loop so they stay index-aligned.
+        Map<String, VolumeVO> currentByUuid = volumeDao.findByInstance(vm.getId()).stream()
+                .collect(Collectors.toMap(VolumeVO::getUuid, v -> v, (a, b) -> a));
+
+        List<String> backedVolumesUUIDs = new ArrayList<>();
+        List<VolumeVO> restoreVolumes = new ArrayList<>();
+        List<String> restoreBackupFiles = new ArrayList<>();
+        for (Backup.VolumeInfo vi : backedVolumes.stream()
                 .sorted(Comparator.comparingLong(Backup.VolumeInfo::getDeviceId))
-                .map(Backup.VolumeInfo::getUuid)
-                .collect(Collectors.toList());
-
-        List<VolumeVO> restoreVolumes = volumeDao.findByInstance(vm.getId()).stream()
-                .sorted(Comparator.comparingLong(VolumeVO::getDeviceId))
-                .collect(Collectors.toList());
-
-        // F3: backedVolumes and restoreVolumes are paired positionally (deviceId asc) so the
-        // per-volume chain replays onto the matching destination volume. Fail fast rather than
-        // silently replaying the wrong chain onto the wrong volume if the two lists diverge.
-        if (backedVolumes.size() != restoreVolumes.size()) {
-            throw new CloudRuntimeException(String.format(
-                    "Cannot restore backup %s to VM %s: backup has %d volume(s) but the VM has %d volume(s)",
-                    backup.getUuid(), vm.getUuid(), backedVolumes.size(), restoreVolumes.size()));
-        }
-        for (int i = 0; i < backedVolumes.size(); i++) {
-            Long backedDeviceId = backedVolumes.get(i).getDeviceId();
-            Long restoreDeviceId = restoreVolumes.get(i).getDeviceId();
-            if (!Objects.equals(backedDeviceId, restoreDeviceId)) {
+                .collect(Collectors.toList())) {
+            VolumeVO current = currentByUuid.get(vi.getUuid());
+            if (current == null) {
                 throw new CloudRuntimeException(String.format(
-                        "Cannot restore backup %s to VM %s: deviceId mismatch at index %d (backup=%s, vm=%s)",
-                        backup.getUuid(), vm.getUuid(), i, backedDeviceId, restoreDeviceId));
+                        "Cannot restore backup %s to VM %s: volume %s from the backup is no longer attached to the VM",
+                        backup.getUuid(), vm.getUuid(), vi.getUuid()));
             }
+            backedVolumesUUIDs.add(vi.getUuid());
+            restoreVolumes.add(current);
+            restoreBackupFiles.add(buildVolumeChainFiles(backup, vi.getPath()));
         }
 
         LOG.debug("Restoring vm {} from backup {} on the RBD Backup Provider", vm, backup);
@@ -682,18 +681,10 @@ public class RbdBackupProvider extends AdapterBase implements BackupProvider, Co
         Pair<List<PrimaryDataStoreTO>, List<String>> volumePoolsAndPaths = getVolumePoolsAndPaths(restoreVolumes);
         restoreCommand.setRestoreVolumePools(volumePoolsAndPaths.first());
         restoreCommand.setRestoreVolumePaths(volumePoolsAndPaths.second());
-        // Replay the EXPLICIT per-volume chain (base full + every incremental link in order) so the
-        // host `rbd import`s the base then `rbd import-diff`s each link. backupFiles.get(idx) is the
-        // comma-joined chain for the volume whose SOURCE path is backedVolumes[idx].getPath(), in the
-        // SAME deviceId order as restoreVolumePaths. See buildVolumeChainFiles.
-        List<String> sourceVolumePaths = backedVolumes.stream()
-                .sorted(Comparator.comparingLong(Backup.VolumeInfo::getDeviceId))
-                .map(Backup.VolumeInfo::getPath)
-                .collect(Collectors.toList());
-        List<String> restoreBackupFiles = new ArrayList<>();
-        for (String sourceVolumePath : sourceVolumePaths) {
-            restoreBackupFiles.add(buildVolumeChainFiles(backup, sourceVolumePath));
-        }
+        // restoreBackupFiles was built in the UUID-pairing loop above, index-aligned with
+        // backedVolumesUUIDs and restoreVolumePaths: entry idx is the comma-joined chain (base full +
+        // every incremental link, root->leaf) for the volume whose SOURCE path is backedVolumes[idx]
+        // .getPath(), replayed onto the destination volume with the SAME UUID. See buildVolumeChainFiles.
         restoreCommand.setBackupFiles(restoreBackupFiles);
         // rbd import-diff requires the destination image to ALREADY contain the snapshot the first
         // .rbdiff was exported --from-snap. That snapshot is the FULL anchor's PARENT_SNAP detail, so
