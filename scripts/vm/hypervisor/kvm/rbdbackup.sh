@@ -381,6 +381,21 @@ restore_vm() {
       exit 1
     fi
     if [[ $idx -eq 0 ]]; then
+      # Restore-to-existing-VM: the destination image is the live VM's current volume. A full
+      # restore replaces the whole disk, and `rbd import` cannot overwrite an existing image
+      # (fails with (17) File exists), so purge any existing image first. `rbd rm` refuses while
+      # snapshots exist, so unprotect+remove them before removing the image.
+      if rbd_cmd info --pool "$pool" "$uuid" >/dev/null 2>&1; then
+        for s in $(rbd_cmd snap ls --pool "$pool" "$uuid" 2>/dev/null | awk 'NR>1 {print $2}'); do
+          # Benign failures (already unprotected / already gone) must not abort under set -e.
+          rbd_cmd snap unprotect --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
+          rbd_cmd snap rm --pool "$pool" "$uuid@$s" >>"$logFile" 2>&1 || true
+        done
+        if ! rbd_cmd rm --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
+          echo "rbd rm failed for existing $pool/$uuid (required before base import)"
+          exit 1
+        fi
+      fi
       # Base full: import the raw image into the destination RBD image.
       if ! rbd_cmd import "$f" --pool "$pool" "$uuid" >>"$logFile" 2>&1; then
         echo "rbd import failed for $f into $pool/$uuid"
