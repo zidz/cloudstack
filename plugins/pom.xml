@@ -64,7 +64,6 @@
         <module>backup/networker</module>
         <module>backup/nas</module>
         <module>backup/kboss</module>
-        <module>backup/rbd</module>
 
         <module>ca/root-ca</module>
 

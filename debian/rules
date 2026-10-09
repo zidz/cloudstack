@@ -84,7 +84,6 @@ override_dh_auto_install:
 	cp -r extensions/* $(DESTDIR)/$(SYSCONFDIR)/$(PACKAGE)/extensions/
 	cp client/target/cloud-client-ui-$(VERSION).jar $(DESTDIR)/usr/share/$(PACKAGE)-management/lib/cloudstack-$(VERSION).jar
 	cp client/target/lib/*jar $(DESTDIR)/usr/share/$(PACKAGE)-management/lib/
-	cp plugins/backup/rbd/target/cloud-plugin-backup-rbd-$(VERSION).jar $(DESTDIR)/usr/share/$(PACKAGE)-management/lib/
 	cp -r engine/schema/dist/systemvm-templates/* $(DESTDIR)/usr/share/$(PACKAGE)-management/templates/systemvm/
 	cp -r plugins/integrations/kubernetes-service/src/main/resources/conf/* $(DESTDIR)/usr/share/$(PACKAGE)-management/cks/conf/
 	rm -rf $(DESTDIR)/usr/share/$(PACKAGE)-management/templates/systemvm/sha512sum.txt

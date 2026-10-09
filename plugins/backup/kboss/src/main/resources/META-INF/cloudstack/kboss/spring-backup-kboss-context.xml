@@ -23,4 +23,8 @@
     <bean id="kbossBackupProvider" class="org.apache.cloudstack.backup.KbossBackupProvider">
         <property name="name" value="kboss"/>
     </bean>
+
+    <bean id="rbdBackupProvider" class="org.apache.cloudstack.backup.RbdBackupProvider">
+        <property name="name" value="rbd"/>
+    </bean>
 </beans>
