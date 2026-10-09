@@ -771,7 +771,20 @@ public class RbdBackupProvider extends AdapterBase implements BackupProvider, Co
             }
         }
         chain.sort(Comparator.comparingInt(this::chainPosition));
-        return chain;
+        // Truncate at the SELECTED backup (inclusive). A restore must replay only the links up to and
+        // including the backup the user chose; replaying later links would advance the restored disk
+        // past the requested backup to a newer state (e.g. restoring the full would land on the latest
+        // incremental). Match by UUID so the selected backup is always kept even if its chain_position
+        // detail is unreadable; if it is somehow absent from the list, return the whole chain rather
+        // than silently dropping the requested backup.
+        List<Backup> truncated = new ArrayList<>();
+        for (Backup b : chain) {
+            truncated.add(b);
+            if (member.getUuid().equals(b.getUuid())) {
+                return truncated;
+            }
+        }
+        return truncated;
     }
 
     private List<String> getBackupFiles(List<Backup.VolumeInfo> backedVolumes) {
