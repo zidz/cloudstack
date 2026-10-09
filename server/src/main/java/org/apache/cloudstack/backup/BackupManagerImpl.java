@@ -374,10 +374,6 @@ public class BackupManagerImpl extends ManagerBase implements BackupManager {
         }
 
         final BackupProvider provider = getBackupProvider(cmd.getZoneId());
-        if (!KBOSS_BACKUP_PROVIDER.equals(provider.getName())) {
-            throw new InvalidParameterValueException("Only KBOSS supports this API currently.");
-        }
-
         if (!provider.isValidProviderOffering(cmd.getZoneId(), null)) {
             throw new CloudRuntimeException(String.format("Backup offering is not valid for provider [%s] in zone [%s]", provider, cmd.getZoneId()));
         }
