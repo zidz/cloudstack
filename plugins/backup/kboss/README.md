@@ -22,10 +22,10 @@ exactly.
 | **Restore-as-template** | Rebuild a chain into a **new, freely-named** RBD image (never touches the source VM), optionally `rbd export` a raw file to register as a template |
 | **Delete** | Best-effort `rbd snap unprotect`/`snap rm` when no remaining chain member needs the snapshot |
 
-The host-side engine is `scripts/vm/hypervisor/kvm/rbdbackup.sh`; the management
-side is `RbdBackupProvider.java`. The KVM agent wrappers route a VM to
-`rbdbackup.sh` **only when every one of its pools is RBD**; NAS/qcow2 VMs keep
-using `nasbackup.sh` unchanged.
+The host-side engine is the in-process `RbdBackupExecutor` (Java, under
+`plugins/hypervisors/kvm/.../storage/`); the management side is `RbdBackupProvider.java`.
+The KVM agent wrappers route a VM to that internal executor **only when every one of
+its pools is RBD**; NAS/qcow2 VMs keep using `nasbackup.sh` unchanged.
 
 ---
 
@@ -92,7 +92,7 @@ rows must carry `provider='rbd'` and the same `zone_id`.
 
 `backup_repository.mount_opts` is **NOT NULL**. If the KMS plugin is installed it
 will try to *decrypt* this column, so leave it an **empty string** (KMS skips
-empty values; `rbdbackup.sh` treats empty as "no extra mount options").
+empty values; the executor treats empty as "no extra mount options").
 
 ```sql
 -- Look up the numeric zone id first:
@@ -157,10 +157,10 @@ provider-specific calls:
 - **On the repository:** `.rbd` files (full) and `.rbdiff` files (incremental).
 - **On Ceph:** `rbd -p cloudstack snap ls <volume-uuid>` shows the protected
   snapshots that anchor the chain.
-- **Script-level (no CloudStack needed):**
-  ```
-  scripts/vm/hypervisor/kvm/rbdbackup.sh --selftest
-  ```
+- **Executor self-test (no Ceph or repo mount needed):** the
+  `RbdBackupExecutorTest` JUnit class under
+  `plugins/hypervisors/kvm/src/test/` exercises the URI parser and the zstd
+  magic sniff without any external dependency.
 
 ---
 
@@ -178,9 +178,9 @@ provider-specific calls:
   attached.
 - **`mount_opts` NOT NULL + KMS.** With the KMS plugin installed, a non-empty
   `mount_opts` is treated as ciphertext and fails to decrypt; use `''`.
-- **Silent fallback.** If `rbdbackup.sh` is not deployed alongside `nasbackup.sh`,
-  the wrappers fall back to `nasbackup.sh` rather than erroring — deploy both
-  scripts together.
+- **In-process executor.** Pure-RBD backup / restore / delete is driven by
+  `RbdBackupExecutor` inside the KVM agent jar; there is no external script to
+  deploy alongside `nasbackup.sh`. NAS/qcow2 VMs keep using `nasbackup.sh`.
 - **Global build coupling.** The provider is registered unconditionally in
   `plugins/pom.xml` and its jar is copied in `debian/rules`, so a defect in this
   module breaks the whole build / management startup, not just RBD.

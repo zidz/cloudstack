@@ -45,6 +45,7 @@ import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.storage.KVMPhysicalDisk;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePool;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePoolManager;
+import com.cloud.hypervisor.kvm.storage.RbdBackupExecutor;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
 import com.cloud.storage.Storage;
@@ -475,62 +476,40 @@ public class LibvirtRestoreBackupCommandWrapper extends CommandWrapper<RestoreBa
     }
 
     /**
-     * Resolve rbdbackup.sh as a sibling of nasbackup.sh (mirrors the take-wrapper helper) so no
-     * change to LibvirtComputingResource is required. Falls back to the NAS path if not found.
-     */
-    private String getRestoreScriptPath(LibvirtComputingResource res) {
-        final String nasPath = res.getNasBackupPath();
-        final String scriptsDir = new java.io.File(nasPath).getParent();
-        final String rbdPath = Script.findScript(scriptsDir, "rbdbackup.sh");
-        return rbdPath != null ? rbdPath : nasPath;
-    }
-
-    /**
-     * Replay one volume's RBD chain (base .rbd + ascending .rbdiff links) by invoking
-     * rbdbackup.sh in explicit-chain restore mode. The backup directory is ALREADY MOUNTED by the
-     * wrapper, so the script must not re-mount. {@code backupFile} is the comma-joined, ordered,
-     * repo-relative chain for THIS volume (base first, then each diff); each entry is turned into
-     * an absolute path under {@code mountDirectory} and passed via --restore-files. The import
-     * DESTINATION (-d) is qualified with mon_host via KVMPhysicalDisk.RBDStringBuilder so the
-     * script synthesizes --conf and targets the right cluster. On non-zero exit, throw with stderr.
+     * Replay one volume's RBD chain (base .rbd + ascending .rbdiff links) through
+     * {@link RbdBackupExecutor} (the Java port of the former bash backup script). The backup directory is
+     * ALREADY MOUNTED by the wrapper, so {@code backupFile}'s comma-joined, ordered, repo-relative
+     * entries (base first, then each diff) are turned into absolute paths under {@code mountDirectory}.
+     * The import destination is qualified with mon_host via {@link KVMPhysicalDisk#RBDStringBuilder}
+     * so the executor targets the right cluster. The existing image is purged first (rbd import cannot
+     * overwrite), the base is imported, its base snapshot recreated (import-diff requires it to exist),
+     * then each diff is replayed in order. Executor hard failures propagate as CloudRuntimeException.
      */
     private void restoreVolumeViaRbdScript(LibvirtComputingResource serverResource, KVMStoragePoolManager storagePoolMgr,
                                            PrimaryDataStoreTO volumePool, String restoreVolumePath, String diskType,
                                            String backupFile, String backupRepoType, String backupRepoAddress,
                                            String mountOptions, String mountDirectory, int timeout, String baseSnap) {
-        String restoreScriptPath = getRestoreScriptPath(serverResource);
         KVMStoragePool volumeStoragePool = storagePoolMgr.getStoragePool(volumePool.getPoolType(), volumePool.getUuid());
         String rbdDestVolume = KVMPhysicalDisk.RBDStringBuilder(volumeStoragePool, restoreVolumePath);
+        RbdBackupExecutor.RbdAuth auth = RbdBackupExecutor.parseRbdUri(rbdDestVolume);
+        String pool = RbdBackupExecutor.getPool(rbdDestVolume);
+        String image = RbdBackupExecutor.getImage(rbdDestVolume);
+
+        // Restore replaces the live volume wholesale: rbd import cannot overwrite an existing image
+        // and rbd rm refuses while snapshots exist, so purge the destination image first.
+        RbdBackupExecutor.purgeImage(auth, pool, image);
+
         String[] chainEntries = backupFile.split(",");
-        StringBuilder absoluteRestoreFiles = new StringBuilder();
         for (int i = 0; i < chainEntries.length; i++) {
-            if (i > 0) {
-                absoluteRestoreFiles.append(",");
+            Path src = Paths.get(mountDirectory + "/" + chainEntries[i]);
+            if (i == 0) {
+                RbdBackupExecutor.importBase(auth, pool, image, src);
+                // import-diff requires the destination to already contain the snapshot the first
+                // .rbdiff was exported --from-snap; create it now (no-op when baseSnap is blank).
+                RbdBackupExecutor.ensureSnap(auth, pool, image, baseSnap);
+            } else {
+                RbdBackupExecutor.importDiff(auth, pool, image, src);
             }
-            absoluteRestoreFiles.append(mountDirectory).append("/").append(chainEntries[i]);
-        }
-        List<String> argv = new ArrayList<>(Arrays.asList(
-                restoreScriptPath,
-                "-o", "restore",
-                "-d", rbdDestVolume,
-                "--restore-files", absoluteRestoreFiles.toString(),
-                "-t", Objects.nonNull(backupRepoType) ? backupRepoType : "",
-                "-s", Objects.nonNull(backupRepoAddress) ? backupRepoAddress : "",
-                "-m", Objects.nonNull(mountOptions) ? mountOptions : ""
-        ));
-        // Only RBD incremental restores carry a base snapshot; a lone full (or NAS) leaves it blank
-        // and the script needs no destination snapshot. rbd import-diff requires this snapshot to
-        // already exist on the destination, so the script recreates it before replaying the diffs.
-        if (StringUtils.isNotBlank(baseSnap)) {
-            argv.add("--base-snap");
-            argv.add(baseSnap);
-        }
-        List<String[]> commands = new ArrayList<>();
-        commands.add(argv.toArray(new String[0]));
-        Pair<Integer, String> result = Script.executePipedCommands(commands, timeout);
-        if (result.first() == null || result.first() != 0) {
-            throw new CloudRuntimeException(String.format("Failed to restore RBD volume [%s] from backup files [%s]: %s",
-                    restoreVolumePath, absoluteRestoreFiles, StringUtils.trimToEmpty(result.second())));
         }
     }
 }

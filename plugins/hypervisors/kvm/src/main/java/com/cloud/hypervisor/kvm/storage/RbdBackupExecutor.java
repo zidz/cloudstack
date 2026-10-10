@@ -563,9 +563,9 @@ public class RbdBackupExecutor {
     public static void importDiff(RbdAuth auth, String pool, String image, Path src) {
         if (isZstdFile(src)) {
             streamRun(Arrays.asList(ZSTD, "-dc", src.toString()),
-                    rbdArgv(auth, "import-diff", "-", "--dest-pool", pool, image), NO_TIMEOUT);
+                    rbdArgv(auth, "import-diff", "-", "--pool", pool, image), NO_TIMEOUT);
         } else {
-            run(rbdArgv(auth, "import-diff", src.toString(), "--dest-pool", pool, image), NO_TIMEOUT);
+            run(rbdArgv(auth, "import-diff", src.toString(), "--pool", pool, image), NO_TIMEOUT);
         }
     }
 

@@ -21,6 +21,7 @@ package com.cloud.hypervisor.kvm.resource.wrapper;
 
 import com.cloud.agent.api.Answer;
 import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
+import com.cloud.hypervisor.kvm.storage.RbdBackupExecutor;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
 import com.cloud.utils.Pair;
@@ -61,23 +62,19 @@ public class LibvirtDeleteBackupCommandWrapper extends CommandWrapper<DeleteBack
         }
         // F1c: the repo-file delete (nasbackup.sh, storage-agnostic) succeeded and is unchanged.
         // If the provider flagged a now-unneeded protected snapshot, attempt unprotect+rm on the
-        // primary pool via rbdbackup.sh delete-snap. A failure here only logs a WARNING: the repo
+        // primary pool via the RBD executor delete-snap. A failure here only logs a WARNING: the repo
         // files are already gone, so a leaked snapshot is strictly better than a stuck delete.
         cleanupRbdSnapshot(command, libvirtComputingResource);
         return new BackupAnswer(command, true, null);
     }
 
     /**
-     * Resolve rbdbackup.sh as a sibling of nasbackup.sh (mirrors the take/restore wrappers) so no
-     * change to LibvirtComputingResource is required. Falls back to the NAS path if not found.
+     * Best-effort unprotect+remove of a now-unneeded protected snapshot on the primary pool via
+     * {@link RbdBackupExecutor} (the Java port of the former bash delete-snap). A failure
+     * only logs a WARNING: the repo files are already gone, so a leaked snapshot is strictly better
+     * than a stuck delete. The executor swallows unprotect failures internally and throws only if
+     * the snap rm itself fails, which this catch turns into the same warning as before.
      */
-    private String getRbdBackupScriptPath(LibvirtComputingResource libvirtComputingResource) {
-        final String nasPath = libvirtComputingResource.getNasBackupPath();
-        final String scriptsDir = new java.io.File(nasPath).getParent();
-        final String rbdPath = Script.findScript(scriptsDir, "rbdbackup.sh");
-        return rbdPath != null ? rbdPath : nasPath;
-    }
-
     private void cleanupRbdSnapshot(DeleteBackupCommand command, LibvirtComputingResource libvirtComputingResource) {
         final String snapName = command.getRbdSnapName();
         final String rbdUri = command.getRbdUri();
@@ -85,22 +82,13 @@ public class LibvirtDeleteBackupCommandWrapper extends CommandWrapper<DeleteBack
             return;
         }
         try {
-            List<String[]> commands = new ArrayList<>();
-            commands.add(new String[]{
-                    getRbdBackupScriptPath(libvirtComputingResource),
-                    "-o", "delete-snap",
-                    "-d", rbdUri,
-                    "--snap-name", snapName
-            });
-            Pair<Integer, String> result = Script.executePipedCommands(commands, libvirtComputingResource.getCmdsTimeout());
-            if (result.first() != 0) {
-                logger.warn(String.format("RBD snapshot cleanup (unprotect+rm) failed for snap %s; repo files already deleted, leaving snapshot leaked: %s",
-                        snapName, result.second()));
-            } else {
-                logger.debug(String.format("RBD snapshot cleanup succeeded for snap %s", snapName));
-            }
+            RbdBackupExecutor.RbdAuth auth = RbdBackupExecutor.parseRbdUri(rbdUri);
+            String pool = RbdBackupExecutor.getPool(rbdUri);
+            String image = RbdBackupExecutor.getImage(rbdUri);
+            RbdBackupExecutor.unprotectAndRemoveSnap(auth, pool, image, snapName);
+            logger.debug(String.format("RBD snapshot cleanup succeeded for snap %s", snapName));
         } catch (Exception e) {
-            logger.warn(String.format("RBD snapshot cleanup raised for snap %s; repo files already deleted, leaving snapshot leaked: %s",
+            logger.warn(String.format("RBD snapshot cleanup (unprotect+rm) failed for snap %s; repo files already deleted, leaving snapshot leaked: %s",
                     snapName, e.getMessage()));
         }
     }

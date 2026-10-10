@@ -25,15 +25,23 @@ import com.cloud.hypervisor.kvm.resource.LibvirtComputingResource;
 import com.cloud.hypervisor.kvm.storage.KVMPhysicalDisk;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePool;
 import com.cloud.hypervisor.kvm.storage.KVMStoragePoolManager;
+import com.cloud.hypervisor.kvm.storage.RbdBackupExecutor;
 import com.cloud.resource.CommandWrapper;
 import com.cloud.resource.ResourceWrapper;
 import com.cloud.storage.Storage;
 import com.cloud.utils.Pair;
+import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.script.Script;
 import org.apache.cloudstack.backup.BackupAnswer;
 import org.apache.cloudstack.backup.TakeBackupCommand;
 import org.apache.cloudstack.storage.to.PrimaryDataStoreTO;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -45,6 +53,7 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
     // nasbackup.sh prints this on stdout when it could not proceed as an incremental and
     // completed a full backup instead; the orchestrator then records the backup as a full.
     private static final String INCREMENTAL_FALLBACK_MARKER = "INCREMENTAL_FALLBACK=true";
+    private static final String BACKUP_TEMP_FILE_PREFIX = "csbackup";
 
     private static final String MODE_FULL = "full";
     private static final String MODE_INCREMENTAL = "incremental";
@@ -86,9 +95,15 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
             }
         }
 
-        // Route pure-RBD VMs to rbdbackup.sh (rbd CLI snapshot/diff engine); every other pool
-        // type keeps the exact nasbackup.sh path. NAS behavior is unchanged byte-for-byte.
-        String backupScriptPath = getBackupScriptPath(libvirtComputingResource, volumePools);
+        // Pure-RBD VMs (every volume pool is RBD) are driven directly by RbdBackupExecutor, which
+        // shells out to the `rbd` CLI (the Java port of the former backup bash script). Every other pool
+        // type - including mixed RBD/non-RBD VMs and the NAS provider's own commands - keeps the
+        // exact nasbackup.sh path, so NAS behavior is unchanged byte-for-byte.
+        if (isPureRbdBackup(volumePools)) {
+            return takeBackupViaExecutor(command, diskPaths);
+        }
+
+        final String backupScriptPath = libvirtComputingResource.getNasBackupPath();
         Pair<Integer, String> result = runBackupScript(libvirtComputingResource, command, vmName, backupRepoType, backupRepoAddress,
                 mountOptions, backupPath, diskPaths, command.getMode(),
                 command.getBitmapNew(), command.getBitmapParent(), command.getParentPaths(), timeout, backupScriptPath);
@@ -120,44 +135,187 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
         return answer;
     }
 
-    /** Remove nasbackup.sh's stdout signalling marker lines so they don't pollute size parsing. */
-    private String stripMarkerLines(String stdout) {
-        if (stdout == null || stdout.isEmpty()) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        for (String line : stdout.split("\n", -1)) {
-            if (line.contains(INCREMENTAL_FALLBACK_MARKER)) {
-                continue;
-            }
-            if (sb.length() > 0) {
-                sb.append('\n');
-            }
-            sb.append(line);
-        }
-        return sb.toString();
-    }
-
     /**
-     * Resolve the host backup script for this command. Pure-RBD VMs (every volume pool is RBD)
-     * route to {@code rbdbackup.sh}, resolved as a sibling of {@code nasbackup.sh} so no change
-     * to {@link LibvirtComputingResource} is required. Any other pool type — including mixed
-     * RBD/non-RBD VMs and the NAS provider's own commands — keeps the exact {@code nasbackup.sh}
-     * path, so NAS behavior is unchanged byte-for-byte.
+     * True only when every volume pool is RBD (pure-RBD VM). Mixed or non-RBD pools return false so
+     * the NAS path stays byte-for-byte unchanged.
      */
-    private String getBackupScriptPath(LibvirtComputingResource libvirtComputingResource, List<PrimaryDataStoreTO> volumePools) {
-        final String nasPath = libvirtComputingResource.getNasBackupPath();
+    private boolean isPureRbdBackup(List<PrimaryDataStoreTO> volumePools) {
         if (volumePools == null || volumePools.isEmpty()) {
-            return nasPath;
+            return false;
         }
         for (PrimaryDataStoreTO pool : volumePools) {
             if (pool == null || pool.getPoolType() != Storage.StoragePoolType.RBD) {
-                return nasPath;
+                return false;
             }
         }
-        final String scriptsDir = new java.io.File(nasPath).getParent();
-        final String rbdPath = Script.findScript(scriptsDir, "rbdbackup.sh");
-        return rbdPath != null ? rbdPath : nasPath;
+        return true;
+    }
+
+    /**
+     * Drive a pure-RBD backup through {@link RbdBackupExecutor}. The repo is mounted here (the
+     * executor never mounts), each disk is exported under {@code <mount>/<backupPath>} with the
+     * exact {@code <name>.<image>.rbd} / {@code <name>.<image>.<ts>.rbdiff} names the provider
+     * expects, and the returned sizes are summed exactly like the script's {@code du} lines. Exports
+     * are compressed (zstd) end-to-end. The repo's global fallback is reproduced: an incremental is
+     * valid only while the parent snapshot exists on EVERY disk; if it is missing anywhere (or the
+     * parent is empty) the whole backup self-heals to a full and the answer's incremental-fallback
+     * flag is set - the same field the NAS stdout marker used to flip.
+     */
+    private Answer takeBackupViaExecutor(TakeBackupCommand command, List<String> diskPaths) {
+        final String backupPath = command.getBackupPath();
+        if (CollectionUtils.isNullOrEmpty(diskPaths)) {
+            return new BackupAnswer(command, false, "No disks to back up");
+        }
+
+        String effectiveMode = StringUtils.isBlank(command.getMode()) ? MODE_LEGACY_FULL : command.getMode();
+        final String parent = command.getBitmapParent();
+        final String snapshotNew = StringUtils.isNotBlank(command.getBitmapNew())
+                ? command.getBitmapNew() : "backup-" + (System.currentTimeMillis() / 1000L);
+        final String ts = StringUtils.substringAfterLast(backupPath, "/").isEmpty()
+                ? backupPath : StringUtils.substringAfterLast(backupPath, "/");
+        final String[] diskTypes = StringUtils.isNotBlank(command.getDiskTypes())
+                ? command.getDiskTypes().split(",") : new String[0];
+
+        String mountDirectory = null;
+        Path backupDir = null;
+        try {
+            mountDirectory = mountBackupDirectory(command.getBackupRepoAddress(), command.getBackupRepoType(), command.getMountOptions());
+            backupDir = Paths.get(mountDirectory).resolve(backupPath);
+            Files.createDirectories(backupDir);
+
+            int disks = diskPaths.size();
+            RbdBackupExecutor.RbdAuth[] auths = new RbdBackupExecutor.RbdAuth[disks];
+            String[] pools = new String[disks];
+            String[] images = new String[disks];
+            for (int idx = 0; idx < disks; idx++) {
+                String uri = diskPaths.get(idx);
+                auths[idx] = RbdBackupExecutor.parseRbdUri(uri);
+                pools[idx] = RbdBackupExecutor.getPool(uri);
+                images[idx] = RbdBackupExecutor.getImage(uri);
+            }
+
+            boolean incrementalFallback = false;
+            if (MODE_INCREMENTAL.equals(effectiveMode)) {
+                boolean parentMissing = StringUtils.isBlank(parent);
+                if (!parentMissing) {
+                    for (int idx = 0; idx < disks; idx++) {
+                        if (!RbdBackupExecutor.parentExists(auths[idx], pools[idx], images[idx], parent)) {
+                            logger.debug(String.format("RBD incremental: parent snapshot %s missing on %s/%s - "
+                                    + "falling back to full for all disks", parent, pools[idx], images[idx]));
+                            parentMissing = true;
+                            break;
+                        }
+                    }
+                }
+                if (parentMissing) {
+                    incrementalFallback = true;
+                    effectiveMode = MODE_FULL;
+                }
+            }
+
+            long totalSize = 0L;
+            for (int idx = 0; idx < disks; idx++) {
+                String name;
+                if (idx < diskTypes.length && StringUtils.isNotBlank(diskTypes[idx])) {
+                    name = diskTypes[idx];
+                } else if (idx == 0) {
+                    name = "root";
+                } else {
+                    name = "datadisk";
+                }
+
+                if (MODE_INCREMENTAL.equals(effectiveMode)) {
+                    Path dest = backupDir.resolve(name + "." + images[idx] + "." + ts + ".rbdiff");
+                    totalSize += RbdBackupExecutor.exportDiff(auths[idx], pools[idx], images[idx], parent, snapshotNew, dest, true);
+                } else {
+                    Path dest = backupDir.resolve(name + "." + images[idx] + ".rbd");
+                    // legacy-full exports the live image with no snapshot chain metadata; a normal
+                    // full creates + protects a snapshot and exports it (the diff base).
+                    String snap = MODE_LEGACY_FULL.equals(effectiveMode) ? "" : snapshotNew;
+                    totalSize += RbdBackupExecutor.exportFull(auths[idx], pools[idx], images[idx], snap, dest, true);
+                }
+            }
+
+            BackupAnswer answer = new BackupAnswer(command, true, String.valueOf(totalSize));
+            answer.setSize(totalSize);
+            answer.setBitmapCreated(command.getBitmapNew());
+            answer.setIncrementalFallback(incrementalFallback);
+            return answer;
+        } catch (CloudRuntimeException | IOException e) {
+            logger.debug("Failed to take RBD VM backup: " + e.getMessage());
+            // Bash cleanup() did rm -rf on the dest dir on failure; mirror that so a mid-loop
+            // export failure does not leave orphaned partial files on the NFS repo.
+            if (backupDir != null) {
+                try {
+                    Script.executeCommand("rm", "-rf", backupDir.toString());
+                } catch (Exception ignored) {
+                    logger.warn("Failed to clean partial backup dir " + backupDir + ": " + ignored.getMessage());
+                }
+            }
+            return new BackupAnswer(command, false, e.getMessage());
+        } finally {
+            if (mountDirectory != null) {
+                // Bash ran sync before umount to flush NFS writes to the backup repo.
+                Script.executeCommand("sync");
+                unmountBackupDirectory(mountDirectory);
+                deleteTemporaryDirectory(mountDirectory);
+            }
+        }
+    }
+
+    private String mountBackupDirectory(String backupRepoAddress, String backupRepoType, String mountOptions) {
+        String randomChars = RandomStringUtils.random(5, true, false);
+        String mountDirectory = String.format("%s.%s", BACKUP_TEMP_FILE_PREFIX, randomChars);
+        try {
+            mountDirectory = Files.createTempDirectory(mountDirectory).toString();
+        } catch (IOException e) {
+            logger.error("Failed to create the tmp mount directory {} for backup", mountDirectory, e);
+            throw new CloudRuntimeException("Failed to create the tmp mount directory for backup on the KVM host");
+        }
+        try {
+            String mountPath = Script.getExecutableAbsolutePath("mount");
+            List<String> mountCmd = new ArrayList<>();
+            mountCmd.add("sudo");
+            mountCmd.add(mountPath);
+            mountCmd.add("-t");
+            mountCmd.add(backupRepoType);
+            mountCmd.add(backupRepoAddress);
+            mountCmd.add(mountDirectory);
+            if ("cifs".equals(backupRepoType)) {
+                if (StringUtils.isBlank(mountOptions)) {
+                    mountOptions = "nobrl";
+                } else {
+                    mountOptions += ",nobrl";
+                }
+            }
+            if (StringUtils.isNotBlank(mountOptions)) {
+                mountCmd.add("-o");
+                mountCmd.add(mountOptions);
+            }
+            Script.executeCommand(mountCmd.toArray(new String[0]));
+        } catch (Exception e) {
+            logger.error("Failed to mount repository {} of type {} to the directory {}", backupRepoAddress, backupRepoType, mountDirectory, e);
+            throw new CloudRuntimeException("Failed to mount the backup repository on the KVM host");
+        }
+        return mountDirectory;
+    }
+
+    private void unmountBackupDirectory(String backupDirectory) {
+        try {
+            String umountPath = Script.getExecutableAbsolutePath("umount");
+            String[] umountCmd = new String[] { "sudo", umountPath, backupDirectory };
+            Script.executeCommand(umountCmd);
+        } catch (Exception e) {
+            logger.error("Failed to unmount backup directory {}", backupDirectory, e);
+        }
+    }
+
+    private void deleteTemporaryDirectory(String backupDirectory) {
+        try {
+            Files.deleteIfExists(Paths.get(backupDirectory));
+        } catch (IOException e) {
+            logger.error("Failed to delete backup directory: {}}", backupDirectory, e);
+        }
     }
 
     /**
@@ -194,16 +352,28 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
             argv.add("--parent-paths");
             argv.add(String.join(",", parentPaths));
         }
-        // Provider-supplied authoritative per-disk types in deviceId-asc order; omit when absent
-        // so the script falls back to positional root/datadisk (NAS path untouched).
-        if (backupScriptPath != null && backupScriptPath.endsWith("rbdbackup.sh") && command.getDiskTypes() != null && !command.getDiskTypes().trim().isEmpty()) {
-            argv.add("--disk-types");
-            argv.add(command.getDiskTypes());
-        }
 
         List<String[]> commands = new ArrayList<>();
         commands.add(argv.toArray(new String[0]));
         return Script.executePipedCommands(commands, timeout);
+    }
+
+    /** Remove nasbackup.sh's stdout signalling marker lines so they don't pollute size parsing. */
+    private String stripMarkerLines(String stdout) {
+        if (stdout == null || stdout.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String line : stdout.split("\n", -1)) {
+            if (line.contains(INCREMENTAL_FALLBACK_MARKER)) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append('\n');
+            }
+            sb.append(line);
+        }
+        return sb.toString();
     }
 
     /**
@@ -213,7 +383,7 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
     private String validateBackupArgs(TakeBackupCommand command) {
         String mode = command.getMode();
         if (mode == null || mode.isEmpty()) {
-            return null; // legacy full-only — no extra args expected
+            return null; // legacy full-only - no extra args expected
         }
         if (MODE_INCREMENTAL.equals(mode)) {
             if (command.getBitmapNew() == null || command.getBitmapNew().isEmpty()) {
@@ -234,7 +404,7 @@ public class LibvirtTakeBackupCommandWrapper extends CommandWrapper<TakeBackupCo
             return null;
         }
         if (MODE_LEGACY_FULL.equals(mode)) {
-            return null; // feature-off full backup — no bitmap or chain args expected
+            return null; // feature-off full backup - no bitmap or chain args expected
         }
         return "Unknown backup mode: " + mode;
     }
